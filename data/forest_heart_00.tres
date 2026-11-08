@@ -1,0 +1,14 @@
+[gd_resource type="Resource" script_class="ItemData" format=3 uid="uid://cy4ph3pg8jw0a"]
+
+[ext_resource type="Script" uid="uid://bpgaer11x0u3d" path="res://systems/salvage_entry.gd" id="1_ywjcx"]
+[ext_resource type="Script" uid="uid://wluy6hnm1xdj" path="res://systems/item_data.gd" id="2_svbe0"]
+
+[resource]
+script = ExtResource("2_svbe0")
+id = &"forest_heart_00"
+display_name = "Heart of the Grove"
+description = "A warm, glowing seed from the Grove Guardian."
+max_stack = 1
+item_type = 8
+material_form = 6
+metadata/_custom_type_script = "uid://wluy6hnm1xdj"

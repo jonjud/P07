@@ -1,0 +1,7 @@
+[gd_resource type="Resource" script_class="CombatParams" format=3 uid="uid://bg3ckialeorko"]
+
+[ext_resource type="Script" uid="uid://ba82sxy373vm" path="res://systems/combat_params.gd" id="1_pscc5"]
+
+[resource]
+script = ExtResource("1_pscc5")
+metadata/_custom_type_script = "uid://ba82sxy373vm"

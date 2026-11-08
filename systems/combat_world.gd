@@ -3,7 +3,6 @@ class_name CombatWorld
 # pure logic: จุดเดียวที่ดาเมจเกิด request -> validate -> compute -> apply -> result
 # actors: id -> {c:Combatant, pos:Vector2, radius:float, team:int, weapon:WeaponData, resolved:int}
 
-const HALF_ANGLE_DEG : float = 60.0   # EXPERIMENTAL (P07-06 ย้ายเป็น config)
 
 var params : CombatParams
 var actors : Dictionary = {}
@@ -11,10 +10,11 @@ var actors : Dictionary = {}
 func _init(p : CombatParams) -> void:
 	params = p
 
-func add_actor(id : String, max_hp : int, pos : Vector2, radius : float, team : int, weapon : WeaponData = null) -> bool:
+func add_actor(id : String, max_hp : int, pos : Vector2, radius : float, team : int, weapon : WeaponData = null, actor_params : CombatParams = null) -> bool:
 	if id == "" or actors.has(id) or max_hp < 1 or not pos.is_finite() or not is_finite(radius) or radius < 0.0:
 		return false
-	actors[id] = {"c": Combatant.new(params, max_hp), "pos": pos, "radius": radius, "team": team, "weapon": weapon, "resolved": 0}
+	var p : CombatParams = actor_params if actor_params != null else params
+	actors[id] = {"c": Combatant.new(p, max_hp), "pos": pos, "radius": radius, "team": team, "weapon": weapon, "resolved": 0}
 	return true
 
 func set_pos(id : String, pos : Vector2) -> bool:
@@ -58,6 +58,44 @@ func resolve_swings(now : float) -> Array:
 			if tid == id or t["team"] == a["team"] or t["c"].state == Combatant.State.DEAD:
 				continue
 			targets.append({"id": tid, "pos": t["pos"], "radius": t["radius"]})
-		for tid in HitCheck.cone(a["pos"], c.aim, w.attack_range, HALF_ANGLE_DEG, targets):
+		for tid in HitCheck.cone(a["pos"], c.aim, w.attack_range, c.p.cone_half_angle, targets):
 			events.append({"attacker": id, "target": tid, "result": actors[tid]["c"].apply_damage(w.damage, now)})
+	return events
+	
+	# จุดดาเมจของ pattern บอส: เรขาคณิตล้วน แล้ว apply_damage ตัวเดิม; หนึ่ง pattern โดนเป้าละครั้ง
+# blockers: [{pos, radius}] บังเฉพาะ line3 (cone/ring ไม่ดูเสา ตามที่ตัดสินไว้)
+func resolve_pattern(id : String, pat : BossPattern, aim : Vector2, blockers : Array, now : float) -> Array:
+	var events : Array = []
+	if not actors.has(id) or pat == null or pat.damage <= 0 or not aim.is_finite() or aim.length() < 0.0001:
+		return events
+	var a : Dictionary = actors[id]
+	if a["c"].state == Combatant.State.DEAD:
+		return events
+	var ids : Array = actors.keys()
+	ids.sort()
+	for k in ids:
+		actors[k]["c"].advance(now)
+	var targets : Array = []
+	for tid in ids:
+		var t : Dictionary = actors[tid]
+		if tid == id or t["team"] == a["team"] or t["c"].state == Combatant.State.DEAD:
+			continue
+		targets.append({"id": tid, "pos": t["pos"], "radius": t["radius"]})
+	var hit : Dictionary = {}
+	if pat.shape == &"cone":
+		for h in HitCheck.cone(a["pos"], aim, pat.reach, pat.half_angle, targets):
+			hit[h] = true
+	elif pat.shape == &"line3":
+		for deg in [0.0, -pat.spread_deg, pat.spread_deg]:
+			for h in HitCheck.line(a["pos"], aim.rotated(deg_to_rad(deg)), pat.reach, pat.width, blockers, targets):
+				hit[h] = true
+	elif pat.shape == &"ring":
+		for h in HitCheck.ring(a["pos"], pat.inner, pat.outer, targets):
+			hit[h] = true
+	else:
+		return events
+	var order : Array = hit.keys()
+	order.sort()
+	for tid in order:
+		events.append({"attacker": id, "target": tid, "result": actors[tid]["c"].apply_damage(pat.damage, now)})
 	return events

@@ -12,6 +12,7 @@ const BAD_SPEED : StringName = &"bad_speed"
 const NOT_ENOUGH_STAMINA : StringName = &"not_enough_stamina"
 const INVALID_QUANTITY : StringName = &"invalid_quantity"
 const INVULNERABLE : StringName = &"invulnerable"
+const INTERNAL : StringName = &"internal"
 # from_dict
 const INCOMPLETE_DATA : StringName = &"incomplete_data"
 const BAD_SCHEMA : StringName = &"bad_schema"

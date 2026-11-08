@@ -7,6 +7,7 @@ const MAX_PLAYERS : int = 2
 const GATHER_RANGE : float = 80.0
 const CHEST_RANGE : float = 96.0
 const CELL_LIMIT : int = 100000
+const REWARD_PREFIX : String = "reward_"
 const MAX_OP_QTY : int = 99
 var db : ItemDatabase
 var invs : Dictionary = {}       # owner_id -> Inventory (ผู้เล่น + shared)
@@ -16,6 +17,13 @@ var positions : Dictionary = {}  # sender -> Vector2 (PlayerSync เขียน
 var grid : BuildGrid = BuildGrid.new()   # โครงสร้าง + chest (host ถือของจริง)
 var starter : Dictionary = {}    # test-only: ของเริ่มต้นของ inventory ใหม่
 var minted : Dictionary = {}     # item -> จำนวนสุทธิที่ host สร้าง (ไว้ตรวจ conservation)
+var flags : Dictionary = {}      # world flag: String -> bool (serialize ได้ ไม่อ้าง node)
+var world : CombatWorld = null
+var boss : BossBrain = null
+var arena : ArenaData = null
+var combat_now : float = 0.0
+var boss_id : String = "boss"
+var rewarded : Array = []   # ผลของ grant ล่าสุด (ให้ NetSession ส่งต่อใน P07-17)
 var allow_client_add : bool = false
 var rdb : RecipeDatabase                 # สูตร (host ถือ)
 var rng : RandomNumberGenerator = null   # ฉีดได้เพื่อเทสต์ซ้ำ (null = สุ่มใหม่ทุกครั้ง)
@@ -35,7 +43,7 @@ static func valid_player_id(pid : Variant) -> bool:
 	if typeof(pid) != TYPE_STRING:
 		return false
 	var s : String = pid
-	if s == SHARED_ID or s.begins_with("chest_"):
+	if s == SHARED_ID or s.begins_with("chest_") or s.begins_with(REWARD_PREFIX):
 		return false
 	var re : RegEx = RegEx.new()
 	re.compile("^[a-z0-9_]{1,40}$")
@@ -116,7 +124,11 @@ func _get_for(sender : int, owner : String) -> Inventory:
 
 func _xfer_inv(sender : int, owner : String) -> Inventory:
 	var i : Inventory = _get_for(sender, owner)
-	return i if i != null else grid.chest(owner)
+	if i != null:
+		return i
+	if peers.has(sender) and owner == reward_bag_id(peers[sender]):
+		return invs.get(owner)
+	return grid.chest(owner)
 
 func _chest_pos(sid : String) -> Variant:
 	if not sid.begins_with("chest_") or not sid.substr(6).is_valid_int():
@@ -243,7 +255,8 @@ func host_handle(sender : int, req : Dictionary) -> Dictionary:
 						push_error("P-10: salvage gain นอกช่วง %s %d (%d..%d)" % [String(g), gain, lo, hi])
 					minted[g] = minted.get(g, 0) + gain
 			touched = [me]
-		
+		"attack", "dodge":
+			return combat_handle(sender, rid, req["op"], req["src"])
 		_:
 			return _err(rid, &"bad_op")
 	if res["reason"] == OpResult.INTERNAL:
@@ -254,3 +267,143 @@ func host_handle(sender : int, req : Dictionary) -> Dictionary:
 			if invs.has(o):    # chest อยู่ใน grid ส่งผ่าน grid ทั้งก้อน
 				changed[o] = invs[o].to_dict()
 	return {"rid": rid, "accepted": true, "net_reason": &"", "result": res, "changed": changed}
+
+static func reward_bag_id(pid : String) -> String:
+	return REWARD_PREFIX + pid
+
+func _gfail(why : StringName) -> Dictionary:
+	return {"ok": false, "reason": why, "given": {}, "changed": {}}
+
+# จุดเดียวที่ให้รางวัลบอส: ตรวจครบก่อนเขียน ให้ครั้งเดียวต่อ flag
+# bonus (ไม่บังคับ): {id:String, item:StringName, amount:int, pos:Vector2} node ที่ปรากฏเป็นผลต่อโลก
+func grant_boss_reward(flag : String, item : StringName, qty : int = 1, bonus : Dictionary = {}) -> Dictionary:
+	if flag == "" or db == null or qty <= 0:
+		return _gfail(&"bad_request")
+	var it : ItemData = db.get_item(item)
+	if it == null:
+		return _gfail(&"unknown_item")
+	if it.max_stack < 1:
+		return _gfail(&"bad_request")
+	if flags.get(flag, false):
+		return _gfail(&"already_granted")
+	var pids : Array = peers.values()
+	pids.sort()
+	if pids.is_empty():
+		return _gfail(&"no_recipients")
+	if not bonus.is_empty():
+		if typeof(bonus.get("id")) != TYPE_STRING or typeof(bonus.get("amount")) != TYPE_INT or bonus["amount"] <= 0:
+			return _gfail(&"bad_request")
+		if bonus["id"] == "" or nodes.has(bonus["id"]) or db.get_item(StringName(bonus["item"])) == null:
+			return _gfail(&"bad_request")
+	for pid in pids:
+		if not invs.has(pid):
+			return _gfail(&"bad_request")
+	flags[flag] = true   # ตั้งก่อนเขียน: ต่อให้พลาดกลางทางก็ไม่ให้ซ้ำ
+	var given : Dictionary = {}
+	var changed : Dictionary = {}
+	for pid in pids:
+		var target : Inventory = invs[pid]
+		var where : StringName = &"inventory"
+		if target.free_space_for(it) < qty:
+			var bid : String = reward_bag_id(pid)
+			var bag : Inventory = invs.get(bid)
+			if bag == null:
+				bag = Inventory.new()
+				bag.owner_id = bid
+				bag.max_slots = 1
+				invs[bid] = bag
+			while bag.free_space_for(it) < qty:
+				bag.max_slots += 1
+			target = bag
+			where = &"bag"
+		var r : Dictionary = target.add_to_existing_stacks(db, item, qty)
+		minted[item] = minted.get(item, 0) + r["done"]
+		if r["done"] != qty:
+			push_error("P-07: grant_boss_reward add ไม่ครบ ถือเป็นบั๊ก")
+		given[pid] = where
+		changed[target.owner_id] = target.to_dict()
+	if not bonus.is_empty():
+		add_node(bonus["id"], StringName(bonus["item"]), bonus["amount"], bonus.get("pos"))
+	return {"ok": true, "reason": &"ok", "given": given, "changed": changed}
+
+func flags_to_dict() -> Dictionary:
+	return {"schema_version": 1, "flags": flags.duplicate()}
+
+static func flags_from_dict(d : Dictionary) -> Dictionary:
+	if not d.has("schema_version") or not d.has("flags"):
+		return {"ok": false, "flags": {}, "reason": &"incomplete_data"}
+	if d["schema_version"] != 1:
+		return {"ok": false, "flags": {}, "reason": &"bad_schema"}
+	if typeof(d["flags"]) != TYPE_DICTIONARY:
+		return {"ok": false, "flags": {}, "reason": &"bad_data"}
+	var out : Dictionary = {}
+	for k in d["flags"]:
+		if typeof(k) != TYPE_STRING or k == "" or typeof(d["flags"][k]) != TYPE_BOOL:
+			return {"ok": false, "flags": {}, "reason": &"bad_data"}
+		out[k] = d["flags"][k]
+	return {"ok": true, "flags": out, "reason": &"ok"}
+
+func start_encounter(bdata : BossData, ar : ArenaData, params : CombatParams) -> bool:
+	if BossData.validate(bdata) != BossData.OK or ar == null or params == null:
+		return false
+	world = CombatWorld.new(params)
+	arena = ar
+	world.add_actor(boss_id, bdata.max_hp, ar.boss_pos, bdata.radius, 1)
+	boss = BossBrain.new(boss_id, bdata)
+	return true
+
+static func parse_aim(s : String) -> Variant:
+	if s.length() > 24:
+		return null
+	var p : PackedStringArray = s.split(",")
+	if p.size() != 2 or not p[0].is_valid_int() or not p[1].is_valid_int():
+		return null
+	var x : int = int(p[0])
+	var y : int = int(p[1])
+	if absi(x) > 100000 or absi(y) > 100000 or (x == 0 and y == 0):
+		return null
+	return Vector2(x, y) / 1000.0
+
+func _sync_actor(sender : int) -> String:
+	var pid : String = peers[sender]
+	if not world.actors.has(pid):
+		var w : WeaponData = WeaponData.new()
+		w.id = &"starter_sword"
+		var pos : Vector2 = positions.get(sender, arena.entry_point())
+		world.add_actor(pid, 100, pos, 12.0, 0, w)
+	elif positions.has(sender):
+		world.set_pos(pid, arena.clamp_pos(positions[sender], 12.0))
+	return pid
+
+func combat_handle(sender : int, rid : int, op : String, src : String) -> Dictionary:
+	if world == null:
+		return _err(rid, &"no_encounter")
+	var aim : Variant = parse_aim(src)
+	if aim == null:
+		return _err(rid, &"bad_request")
+	var pid : String = _sync_actor(sender)
+	var res : Dictionary
+	if op == "attack":
+		res = world.attack(pid, combat_now, aim)
+	else:
+		res = world.actors[pid]["c"].start_dodge(combat_now, aim)
+	return {"rid": rid, "accepted": true, "net_reason": &"", "result": res, "changed": {}}
+
+# host เรียกทุก tick; คืน events; ให้รางวัลเมื่อบอสตาย (ครั้งเดียวด้วย flag)
+func tick(now : float) -> Array:
+	if world == null:
+		return []
+	combat_now = maxf(combat_now, now)
+	for s in peers:
+		_sync_actor(s)
+	if not boss.engaged and not peers.is_empty():
+		for s in peers:
+			if world.actors[peers[s]]["pos"].distance_to(arena.entry_point()) > 40.0:
+				boss.engaged = true
+	var ev : Array = boss.step(combat_now, world, arena.pillars())
+	ev.append_array(world.resolve_swings(combat_now))
+	if EncounterState.result(world, boss_id) == EncounterState.R.WON and not flags.get("grove_guardian_defeated", false):
+		var g : Dictionary = grant_boss_reward("grove_guardian_defeated", &"forest_heart_00", 1)
+		if g["ok"]:
+			rewarded = [g]
+	return ev
