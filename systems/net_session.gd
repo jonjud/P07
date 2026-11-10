@@ -29,22 +29,26 @@ var my_pid : String = ""
 var hello_pv : int = HostLogic.PROTOCOL_VERSION   # --badpv ใช้ทดสอบ
 var accepted : Dictionary = {}   # peer id -> true (ฝั่ง host)
 
+var combat_view : Dictionary = {}   # client: snapshot ล่าสุด
+var _snap_t : float = 0.0
+var clock_off : float = 0.0   # client: เวลา host - เวลาเครื่องนี้
+signal combat_changed
+signal respawn_at(pos : Vector2)
+
 static func db_sig(d : ItemDatabase, r : RecipeDatabase = null) -> String:
 	var ids : Array = d._items.keys().map(func(k): return String(k))
 	ids.sort()
-	var s : String = "%d:%s" % [ids.size(), "|".join(ids).sha256_text()]
+	var extra : Array = []
+	var er : Dictionary = EnemyLoader.load_dir("res://data/enemies/")
+	for k in er["enemies"]:
+		extra.append("enemy:" + String(k))
+	extra.append("boss:" + String(BossData.grove().id))
+	extra.append("pv_combat:%d" % CombatSnapshot.SCHEMA_VERSION)
 	if r != null:
-		var parts : Array = []
 		for rid in r.all_ids():
-			var rc : CraftingRecipe = r.get_recipe(rid)
-			var p : String = "%s@%s" % [String(rid), String(rc.station_required)]
-			for i in rc.inputs:
-				p += "|i:%s*%d" % [String(i.item_id), i.quantity]
-			for o in rc.outputs:
-				p += "|o:%s*%d" % [String(o.item_id), o.quantity]
-			parts.append(p)
-		s += ":" + "\n".join(parts).sha256_text()
-	return s
+			extra.append("recipe:" + String(rid))
+	extra.sort()
+	return "%d:%s" % [ids.size(), ("|".join(ids) + "#" + "|".join(extra)).sha256_text()]
 
 # player_id ถาวร (D-23): สร้างครั้งแรกแล้วเก็บในเครื่อง override ไว้ทดสอบหลาย instance บนเครื่องเดียว
 static func load_player_id(override : String = "") -> String:
@@ -325,3 +329,50 @@ func send_raw(req : Dictionary) -> void:   # dev: ส่งคำขอปลอ
 
 func _dev_state() -> String:
 	return state_hash(logic.invs) + grid_hash(logic.grid.to_dict()) + str(logic.nodes.hash())
+
+
+
+@rpc("authority", "call_remote", "unreliable_ordered")
+func cli_combat(d : Dictionary) -> void:
+	var r : Dictionary = CombatSnapshot.validate(d, CombatParams.new())
+	if r["ok"]:
+		combat_view = d
+		if d.has("now") and (typeof(d["now"]) == TYPE_FLOAT or typeof(d["now"]) == TYPE_INT) and is_finite(float(d["now"])):
+			clock_off = float(d["now"]) - Time.get_ticks_msec() / 1000.0
+		combat_changed.emit()
+
+func _process(delta : float) -> void:
+	if logic == null or logic.world == null:
+		return
+	if not logic.rewarded.is_empty():
+		var g : Dictionary = logic.rewarded[0]
+		logic.rewarded = []
+		for p in accepted:
+			if p != 1:
+				cli_delta.rpc_id(p, g["changed"])
+		inventories_changed.emit()
+	_snap_t += delta
+	if _snap_t < 0.1:
+		return
+	for ch in logic.changes:
+		for p in accepted:
+			if p != 1:
+				cli_delta.rpc_id(p, ch)
+		inventories_changed.emit()
+	logic.changes = []
+	for rs in logic.respawned:
+		if rs["sender"] == 1:
+			respawn_at.emit(rs["pos"])
+		elif accepted.has(rs["sender"]):
+			cli_respawn.rpc_id(rs["sender"], rs["pos"])
+	logic.respawned = []
+	_snap_t = 0.0
+	var d : Dictionary = CombatSnapshot.to_dict(logic.world, logic.boss, logic.flags)
+	d["now"] = logic.combat_now
+	for p in accepted:
+		if p != 1:
+			cli_combat.rpc_id(p, d)
+
+@rpc("authority", "call_remote", "reliable")
+func cli_respawn(pos : Vector2) -> void:
+	respawn_at.emit(pos)

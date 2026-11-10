@@ -38,6 +38,8 @@ func _ready() -> void:
 	net.player_joined.connect(_on_joined)
 	net.player_left.connect(_on_left)
 	net.result_received.connect(_on_result)
+	net.respawn_at.connect(func(pos : Vector2) -> void:
+		if sync.local != null: sync.local.global_position = pos)
 	if "--badpv" in a: net.hello_pv = 99
 	if "--dropitem" in a: net.db._items.erase(net.db._items.keys()[0])
 	var fz : Callable = Callable()
@@ -68,6 +70,7 @@ func _on_status(s : int, _d : String) -> void:
 		lg.add_node("f1", &"fiber_00", 40, Vector2(320, 250))
 		lg.add_node("o1", &"ore_00", 40, Vector2(352, 428))
 		lg.add_node("f2", &"fiber_00", 40, Vector2(352, 404))
+		lg.start_encounter(BossData.grove(), BossNetView.make_arena(), CombatParams.new())
 		_enter(Vector2(320, 400))
 	elif s == NetSession.Status.CONNECTED:
 		_enter(Vector2(384, 400))
@@ -84,6 +87,10 @@ func _enter(spawn : Vector2) -> void:
 	sync.world.add_child(bf)
 	sync.world.move_child(bf, 1)
 	bf.setup(net, sync.local, wf)
+	var bn : BossNetView = BossNetView.new()
+	sync.world.add_child(bn)
+	sync.world.move_child(bn, 2)
+	bn.setup(net, sync.local, bf)
 
 func _on_joined(_id : int, p : String) -> void:
 	sync.broadcast_roster()
@@ -270,3 +277,9 @@ func _cfuzz() -> void:
 		w += 1
 		await get_tree().process_frame
 	print("[%s] CFUZZ sent=%d results=%d pending=%d won=%d diverge=%d" % [pid, sent, stat["n"], sent - stat["n"], stat["won"], stat["diverge"]])
+
+func _physics_process(_d : float) -> void:
+	if net != null and net.logic != null and net.logic.world != null:
+		var now : float = Time.get_ticks_msec() / 1000.0
+		net.logic.combat_now = maxf(net.logic.combat_now, now)
+		net.logic.tick(now)

@@ -36,7 +36,7 @@ func _begin(now : float, world : CombatWorld, bc : Combatant) -> void:
 	ids.sort()
 	for tid in ids:
 		var t : Dictionary = world.actors[tid]
-		if t["team"] == me["team"] or t["c"].state == Combatant.State.DEAD:
+		if t["team"] == me["team"] or t["c"].state == Combatant.State.DEAD or t.get("parked", false):
 			continue
 		var d : float = (t["pos"] - me["pos"]).length()
 		if d < best_d:

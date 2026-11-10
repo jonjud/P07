@@ -15,3 +15,8 @@ func _ready() -> void:
 	EncounterTests.new().run_all()
 	RewardTests.new().run_all()
 	CombatHostTests.new().run_all()
+	CombatSnapshotTests.new().run_all()
+	InventoryTests.new().run_all()
+	BuildGridTests.new().run_all()
+	CraftTests.new().run_all()
+	DeathTests.new().run_all()

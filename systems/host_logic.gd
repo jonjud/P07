@@ -8,6 +8,7 @@ const GATHER_RANGE : float = 80.0
 const CHEST_RANGE : float = 96.0
 const CELL_LIMIT : int = 100000
 const REWARD_PREFIX : String = "reward_"
+const DEATH_PREFIX : String = "death_"
 const MAX_OP_QTY : int = 99
 var db : ItemDatabase
 var invs : Dictionary = {}       # owner_id -> Inventory (ผู้เล่น + shared)
@@ -24,11 +25,17 @@ var arena : ArenaData = null
 var combat_now : float = 0.0
 var boss_id : String = "boss"
 var rewarded : Array = []   # ผลของ grant ล่าสุด (ให้ NetSession ส่งต่อใน P07-17)
+var dead_at : Dictionary = {}        # pid -> เวลาตาย (ถุงสร้างแล้ว รอเกิดใหม่)
+var respawn_delay : float = 3.0
+var death_drop : float = 1.0         # สัดส่วนที่ทิ้งเข้าถุง (ตั้งได้)
+var respawned : Array = []           # [{pid, sender, pos}] ให้ NetSession ส่งต่อ
+var changes : Array = []             # changed dict ที่ NetSession ต้องส่งให้ client
 var allow_client_add : bool = false
 var rdb : RecipeDatabase                 # สูตร (host ถือ)
 var rng : RandomNumberGenerator = null   # ฉีดได้เพื่อเทสต์ซ้ำ (null = สุ่มใหม่ทุกครั้ง)
 var bound_fail : int = 0                 # salvage ได้ของนอกช่วง core..max (ต้องเป็น 0)
 var _seen : Dictionary = {}
+
 
 func _err(rid : int, why : StringName) -> Dictionary:
 	return {"rid": rid, "accepted": false, "net_reason": why, "result": null, "changed": {}}
@@ -43,7 +50,7 @@ static func valid_player_id(pid : Variant) -> bool:
 	if typeof(pid) != TYPE_STRING:
 		return false
 	var s : String = pid
-	if s == SHARED_ID or s.begins_with("chest_") or s.begins_with(REWARD_PREFIX):
+	if s == SHARED_ID or s.begins_with("chest_") or s.begins_with(REWARD_PREFIX) or s.begins_with(DEATH_PREFIX):
 		return false
 	var re : RegEx = RegEx.new()
 	re.compile("^[a-z0-9_]{1,40}$")
@@ -85,6 +92,8 @@ func join(sender : int, pid : Variant) -> Dictionary:
 		for it in starter:   # ให้เฉพาะ inventory ใหม่ reconnect ไม่ได้ซ้ำ
 			var r : Dictionary = inv.add_to_existing_stacks(db, it, starter[it])
 			minted[it] = minted.get(it, 0) + r["done"]
+	if world != null and world.actors.has(p):
+		world.set_parked(p, false)
 	peers[sender] = p
 	return _join_res(true, &"ok", p)
 
@@ -98,6 +107,9 @@ func add_node(node_id : String, item : StringName, amount : int, pos : Variant =
 	return true
 
 func leave(sender : int) -> void:
+	var pid : String = peers.get(sender, "")
+	if world != null and pid != "" and world.actors.has(pid):
+		world.set_parked(pid, true)
 	peers.erase(sender)
 	positions.erase(sender)
 	_seen.erase(sender)
@@ -126,7 +138,7 @@ func _xfer_inv(sender : int, owner : String) -> Inventory:
 	var i : Inventory = _get_for(sender, owner)
 	if i != null:
 		return i
-	if peers.has(sender) and owner == reward_bag_id(peers[sender]):
+	if peers.has(sender) and (owner == reward_bag_id(peers[sender]) or owner == death_bag_id(peers[sender])):
 		return invs.get(owner)
 	return grid.chest(owner)
 
@@ -366,13 +378,13 @@ static func parse_aim(s : String) -> Variant:
 
 func _sync_actor(sender : int) -> String:
 	var pid : String = peers[sender]
+	var pos : Variant = positions.get(sender)
 	if not world.actors.has(pid):
 		var w : WeaponData = WeaponData.new()
 		w.id = &"starter_sword"
-		var pos : Vector2 = positions.get(sender, arena.entry_point())
-		world.add_actor(pid, 100, pos, 12.0, 0, w)
-	elif positions.has(sender):
-		world.set_pos(pid, arena.clamp_pos(positions[sender], 12.0))
+		world.add_actor(pid, 100, pos if typeof(pos) == TYPE_VECTOR2 else arena.entry_point(), 12.0, 0, w)
+	elif typeof(pos) == TYPE_VECTOR2:
+		world.set_pos(pid, pos)
 	return pid
 
 func combat_handle(sender : int, rid : int, op : String, src : String) -> Dictionary:
@@ -396,9 +408,9 @@ func tick(now : float) -> Array:
 	combat_now = maxf(combat_now, now)
 	for s in peers:
 		_sync_actor(s)
-	if not boss.engaged and not peers.is_empty():
+	if not boss.engaged:
 		for s in peers:
-			if world.actors[peers[s]]["pos"].distance_to(arena.entry_point()) > 40.0:
+			if world.actors[peers[s]]["pos"].distance_to(arena.boss_pos) < arena.radius - 40.0:
 				boss.engaged = true
 	var ev : Array = boss.step(combat_now, world, arena.pillars())
 	ev.append_array(world.resolve_swings(combat_now))
@@ -406,4 +418,81 @@ func tick(now : float) -> Array:
 		var g : Dictionary = grant_boss_reward("grove_guardian_defeated", &"forest_heart_00", 1)
 		if g["ok"]:
 			rewarded = [g]
+	_death_pass(combat_now)
 	return ev
+
+static func death_bag_id(pid : String) -> String:
+	return DEATH_PREFIX + pid
+
+func on_player_died(pid : String, now : float) -> Dictionary:
+	var fail : Dictionary = {"ok": false, "reason": &"bad_request", "changed": {}}
+	if world == null or not world.actors.has(pid) or not invs.has(pid) or dead_at.has(pid):
+		return fail
+	if world.actors[pid]["c"].state != Combatant.State.DEAD:
+		return fail
+	var inv : Inventory = invs[pid]
+	var counts : Dictionary = {}
+	for s in inv.slots:
+		if s != null and s.item_data != null and s.quantity > 0:
+			var k : String = String(s.item_data.id)
+			counts[k] = counts.get(k, 0) + s.quantity
+	var ids : Array = counts.keys()
+	ids.sort()
+	var bid : String = death_bag_id(pid)
+	var bag : Inventory = invs.get(bid)
+	for k in ids:
+		var id : StringName = StringName(k)
+		var it : ItemData = db.get_item(id)
+		var n : int = mini(counts[k], int(floor(counts[k] * death_drop + 0.0001)))
+		if it == null or n <= 0:
+			continue
+		if bag == null:
+			bag = Inventory.new()
+			bag.owner_id = bid
+			bag.max_slots = 1
+			invs[bid] = bag
+		while bag.free_space_for(it) < n:
+			bag.max_slots += 1
+		var r : Dictionary = inv.transfer_to(bag, db, id, n)
+		if r["done"] != n:
+			push_error("P-07: on_player_died transfer ไม่ครบ ถือเป็นบั๊ก")
+	dead_at[pid] = now
+	var changed : Dictionary = {pid: inv.to_dict()}
+	if bag != null:
+		changed[bid] = bag.to_dict()
+	changes.append(changed)
+	return {"ok": true, "reason": &"ok", "changed": changed}
+
+func respawn(pid : String, sender : int) -> bool:
+	if world == null or not dead_at.has(pid) or not world.actors.has(pid):
+		return false
+	var a : Dictionary = world.actors[pid]
+	if a["c"].state != Combatant.State.DEAD:
+		dead_at.erase(pid)
+		return false
+	var old : Combatant = a["c"]
+	a["c"] = Combatant.new(old.p, old.max_hp)
+	a["resolved"] = 0   # swing_id ของ Combatant ใหม่เริ่มที่ 0
+	a["pos"] = arena.entry_point()
+	positions[sender] = arena.entry_point()
+	dead_at.erase(pid)
+	respawned.append({"pid": pid, "sender": sender, "pos": arena.entry_point()})
+	return true
+
+func _death_pass(now : float) -> void:
+	var fresh : Array = []
+	for id in world.actors:
+		var a : Dictionary = world.actors[id]
+		if id != boss_id and a["team"] == 0 and a["c"].state == Combatant.State.DEAD and not dead_at.has(id):
+			fresh.append(id)
+	fresh.sort()
+	for pid in fresh:
+		on_player_died(pid, now)
+	var connected : Dictionary = {}
+	for s in peers:
+		connected[peers[s]] = s
+	var due : Array = dead_at.keys()
+	due.sort()
+	for pid in due:
+		if connected.has(pid) and now >= dead_at[pid] + respawn_delay:
+			respawn(pid, connected[pid])

@@ -14,13 +14,19 @@ func add_actor(id : String, max_hp : int, pos : Vector2, radius : float, team : 
 	if id == "" or actors.has(id) or max_hp < 1 or not pos.is_finite() or not is_finite(radius) or radius < 0.0:
 		return false
 	var p : CombatParams = actor_params if actor_params != null else params
-	actors[id] = {"c": Combatant.new(p, max_hp), "pos": pos, "radius": radius, "team": team, "weapon": weapon, "resolved": 0}
+	actors[id] = {"c": Combatant.new(p, max_hp), "pos": pos, "radius": radius, "team": team, "weapon": weapon, "resolved": 0, "parked": false}
 	return true
 
 func set_pos(id : String, pos : Vector2) -> bool:
 	if not actors.has(id) or not pos.is_finite():
 		return false
 	actors[id]["pos"] = pos
+	return true
+
+func set_parked(id : String, v : bool) -> bool:
+	if not actors.has(id):
+		return false
+	actors[id]["parked"] = v
 	return true
 
 func hp_of(id : String) -> int:
@@ -55,7 +61,7 @@ func resolve_swings(now : float) -> Array:
 		var targets : Array = []
 		for tid in ids:
 			var t : Dictionary = actors[tid]
-			if tid == id or t["team"] == a["team"] or t["c"].state == Combatant.State.DEAD:
+			if tid == id or t["team"] == a["team"] or t["c"].state == Combatant.State.DEAD or t.get("parked", false):
 				continue
 			targets.append({"id": tid, "pos": t["pos"], "radius": t["radius"]})
 		for tid in HitCheck.cone(a["pos"], c.aim, w.attack_range, c.p.cone_half_angle, targets):
@@ -78,7 +84,7 @@ func resolve_pattern(id : String, pat : BossPattern, aim : Vector2, blockers : A
 	var targets : Array = []
 	for tid in ids:
 		var t : Dictionary = actors[tid]
-		if tid == id or t["team"] == a["team"] or t["c"].state == Combatant.State.DEAD:
+		if tid == id or t["team"] == a["team"] or t["c"].state == Combatant.State.DEAD or t.get("parked", false):
 			continue
 		targets.append({"id": tid, "pos": t["pos"], "radius": t["radius"]})
 	var hit : Dictionary = {}
